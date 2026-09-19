@@ -170,7 +170,8 @@
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-xl);
       box-shadow: var(--shadow-surface);
-      backdrop-filter: blur(28px);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       overflow: hidden;
       position: relative;
     }
@@ -543,7 +544,8 @@
       width: var(--sidebar-width);
       background: rgba(6, 9, 17, 0.88);
       border-right: 1px solid var(--border-line);
-      backdrop-filter: blur(24px);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       padding: 24px 16px;
       display: flex;
       flex-direction: column;
@@ -1764,18 +1766,18 @@
 
             <div class="form-row-2">
               <div class="input-field">
-                <label for="amount">Quantidade de Canais (1 - 10)</label>
+                <label for="amount">Quantidade de Canais (1 - 100)</label>
                 <div class="quick-range-wrap">
-                  <input id="amountRange" type="range" min="1" max="10" value="3" />
-                  <input id="amount" type="number" min="1" max="10" value="3" style="width: 70px; text-align: center;" />
+                  <input id="amountRange" type="range" min="1" max="100" value="3" />
+                  <input id="amount" type="number" min="1" max="100" value="3" style="width: 70px; text-align: center;" />
                 </div>
               </div>
 
               <div class="input-field">
-                <label for="messageAmount">Mensagens por Canal (0 - 3)</label>
+                <label for="messageAmount">Mensagens por Canal (0 - 100)</label>
                 <div class="quick-range-wrap">
-                  <input id="messageAmountRange" type="range" min="0" max="3" value="1" />
-                  <input id="messageAmount" type="number" min="0" max="3" value="1" style="width: 70px; text-align: center;" />
+                  <input id="messageAmountRange" type="range" min="0" max="100" value="1" />
+                  <input id="messageAmount" type="number" min="0" max="100" value="1" style="width: 70px; text-align: center;" />
                 </div>
               </div>
             </div>
@@ -2236,37 +2238,53 @@
       }
     }
 
-    // Discord API Direct Fallback (For static Vercel deploys)
-    async function directDiscordRest(endpoint, method = "GET", body = null) {
-      const url = `https://discord.com/api/v10${endpoint}`;
-      const res = await fetch(url, {
-        method,
-        headers: {
-          Authorization: `Bot ${state.botToken}`,
-          "Content-Type": "application/json"
-        },
-        body: body ? JSON.stringify(body) : null
-      });
-
-      if (res.status === 204) return null;
-      const data = await res.json().catch(() => null);
-      if (!res.ok) {
-        throw new Error(data?.message || `Discord HTTP ${res.status}`);
-      }
-      return data;
+    let previewRaf = null;
+    function schedulePreviewUpdate() {
+      if (previewRaf) cancelAnimationFrame(previewRaf);
+      previewRaf = requestAnimationFrame(updateLivePreview);
     }
 
-    // Unified API Dispatcher
+    // Discord API Direct Fallback (For static Vercel deploys) com timeout
+    async function directDiscordRest(endpoint, method = "GET", body = null) {
+      const url = `https://discord.com/api/v10${endpoint}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: {
+            Authorization: `Bot ${state.botToken}`,
+            "Content-Type": "application/json"
+          },
+          body: body ? JSON.stringify(body) : null,
+          signal: controller.signal
+        });
+
+        if (res.status === 204) return null;
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error(data?.message || `Discord HTTP ${res.status}`);
+        }
+        return data;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // Unified API Dispatcher com tempo de resposta ultrarrápido
     async function chamarApi(rota, dados = {}) {
       try {
         setBusy(true);
         setDockStatus(`Executando ${rota}...`, "loading");
         addLog(`Disparando POST ${rota}...`, "info");
 
-        // Try calling the Node/Express backend first
         let resposta = null;
         let resultado = null;
         let backendFailed = false;
+
+        const backendController = new AbortController();
+        const backendTimeout = setTimeout(() => backendController.abort(), 7000);
 
         try {
           resposta = await fetch(rota, {
@@ -2277,22 +2295,25 @@
               "x-bot-token": state.botToken,
               "x-guild-id": state.guildId
             },
-            body: JSON.stringify(dados)
+            body: JSON.stringify(dados),
+            signal: backendController.signal
           });
           resultado = await resposta.json().catch(() => null);
         } catch {
           backendFailed = true;
+        } finally {
+          clearTimeout(backendTimeout);
         }
 
-        // If backend is unavailable (e.g. purely static Vercel deployment), execute via direct Discord REST v10
+        // Se o backend Express estiver indisponível (deploy estático na Vercel), executa direto via Discord REST
         if (backendFailed || (resposta && resposta.status === 404)) {
-          addLog("Backend Express inacessível. Executando via Discord REST v10 direto...", "warn");
+          addLog("Backend Express indisponível. Executando via Discord REST v10 direto (Modo Paralelo)...", "warn");
           resultado = await executeDirectDiscordAction(rota, dados);
           resposta = { ok: true, status: 200 };
         }
 
         if (resposta && resposta.status === 401) {
-          const msg = resultado?.message || "Senha do painel ou token inválido.";
+          const msg = resultado?.message || "Senha do painel ou token incorreto.";
           setDockStatus(`Erro 401: ${msg}`, "err");
           addLog(`Falha de autenticação: ${msg}`, "err");
           showToast(msg);
@@ -2328,7 +2349,7 @@
       }
     }
 
-    // Direct Discord REST fallback runner
+    // Direct Discord REST fallback runner com paralelismo máximo
     async function executeDirectDiscordAction(rota, dados) {
       if (!state.botToken || !state.guildId) {
         throw new Error("Token do bot ou Guild ID não definidos.");
@@ -2349,59 +2370,79 @@
           return false;
         });
 
+        // Deleção simultânea em lote paralelo
         let deleted = 0;
-        for (const ch of targets) {
-          try {
-            await directDiscordRest(`/channels/${ch.id}`, "DELETE");
-            deleted++;
-          } catch (e) {
-            console.warn(`Erro ao apagar ${ch.id}:`, e.message);
-          }
-        }
+        const deleteTasks = targets.map(ch => directDiscordRest(`/channels/${ch.id}`, "DELETE").catch(() => null));
+        const results = await Promise.allSettled(deleteTasks);
+        results.forEach(r => { if (r.status === "fulfilled") deleted++; });
+
         return { ok: true, message: `Canais apagados: ${deleted}` };
       }
 
       if (rota === "/api/create-text") {
         const count = Math.min(dados.amount || 1, 10);
-        let created = 0;
+        // Criação paralela simultânea de todos os canais
+        const channelTasks = [];
         for (let i = 1; i <= count; i++) {
-          const ch = await directDiscordRest(`/guilds/${state.guildId}/channels`, "POST", {
-            name: `${dados.baseName}-${i}`,
-            type: 0
-          });
-          created++;
-          if (dados.message && dados.messageAmount > 0 && ch && ch.id) {
+          channelTasks.push(
+            directDiscordRest(`/guilds/${state.guildId}/channels`, "POST", {
+              name: `${dados.baseName}-${i}`,
+              type: 0
+            })
+          );
+        }
+        const createdResults = await Promise.allSettled(channelTasks);
+        const createdChannels = createdResults
+          .filter(r => r.status === "fulfilled" && r.value?.id)
+          .map(r => r.value);
+
+        // Envio paralelo de mensagens
+        if (dados.message && dados.messageAmount > 0 && createdChannels.length > 0) {
+          const msgTasks = [];
+          for (const ch of createdChannels) {
             for (let m = 0; m < dados.messageAmount; m++) {
-              await directDiscordRest(`/channels/${ch.id}/messages`, "POST", { content: dados.message });
+              msgTasks.push(directDiscordRest(`/channels/${ch.id}/messages`, "POST", { content: dados.message }).catch(() => null));
             }
           }
+          await Promise.allSettled(msgTasks);
         }
-        return { ok: true, message: `Canais criados: ${created}` };
+        return { ok: true, message: `Canais criados: ${createdChannels.length}` };
       }
 
       if (rota === "/api/reset") {
         if (dados.newName) {
           await directDiscordRest(`/guilds/${state.guildId}`, "PATCH", { name: dados.newName }).catch(() => null);
         }
-        // delete all
+        // Deleta todos os canais em paralelo
         const channels = await directDiscordRest(`/guilds/${state.guildId}/channels`, "GET");
-        for (const ch of (channels || [])) {
-          if (ch.type === 0 || ch.type === 2) {
-            await directDiscordRest(`/channels/${ch.id}`, "DELETE").catch(() => null);
-          }
-        }
-        // create channels
+        const targets = (channels || []).filter(c => c.type === 0 || c.type === 2);
+        await Promise.allSettled(targets.map(ch => directDiscordRest(`/channels/${ch.id}`, "DELETE").catch(() => null)));
+
+        // Cria novos canais em paralelo
         const count = Math.min(dados.amount || 1, 10);
+        const channelTasks = [];
         for (let i = 1; i <= count; i++) {
-          const ch = await directDiscordRest(`/guilds/${state.guildId}/channels`, "POST", {
-            name: `${dados.baseName}-${i}`,
-            type: 0
-          });
-          if (dados.message && dados.messageAmount > 0 && ch && ch.id) {
+          channelTasks.push(
+            directDiscordRest(`/guilds/${state.guildId}/channels`, "POST", {
+              name: `${dados.baseName}-${i}`,
+              type: 0
+            })
+          );
+        }
+        const createdResults = await Promise.allSettled(channelTasks);
+        const createdChannels = createdResults
+          .filter(r => r.status === "fulfilled" && r.value?.id)
+          .map(r => r.value);
+
+        // Dispara mensagens em paralelo
+        if (dados.message && dados.messageAmount > 0 && createdChannels.length > 0) {
+          const msgTasks = [];
+          for (const ch of createdChannels) {
             for (let m = 0; m < dados.messageAmount; m++) {
-              await directDiscordRest(`/channels/${ch.id}/messages`, "POST", { content: dados.message }).catch(() => null);
+              msgTasks.push(directDiscordRest(`/channels/${ch.id}/messages`, "POST", { content: dados.message }).catch(() => null));
             }
           }
+          await Promise.allSettled(msgTasks);
         }
         return { ok: true, message: "Protocolo NUKE concluído com sucesso." };
       }
@@ -2564,38 +2605,55 @@
       }
 
       submitBtn.disabled = true;
-      submitBtn.innerHTML = '<span class="spinner"></span> Validando com a API...';
+      submitBtn.innerHTML = '<span class="spinner"></span> Conectando...';
 
       try {
-        // Validate token against Discord API /users/@me
         let botData = null;
+
+        // Validação ultrarrápida (timeout de 2.5s para não travar a tela)
+        const ctrl = new AbortController();
+        const tId = setTimeout(() => ctrl.abort(), 2500);
+
         try {
-          const testRes = await fetch("https://discord.com/api/v10/users/@me", {
-            headers: { Authorization: `Bot ${botToken}` }
-          });
-          if (testRes.ok) {
-            const rawUser = await testRes.json();
-            botData = {
-              id: rawUser.id,
-              username: rawUser.username,
-              tag: `${rawUser.username}${rawUser.discriminator && rawUser.discriminator !== '0' ? '#' + rawUser.discriminator : ''}`,
-              avatar: rawUser.avatar ? `https://cdn.discordapp.com/avatars/${rawUser.id}/${rawUser.avatar}.png` : null
-            };
-          }
-        } catch {
-          // If direct fetch fails (e.g. CORS), try via backend /api/validate-token
+          // Tenta primeiro via backend local
           const backendTest = await fetch("/api/validate-token", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ token: botToken })
+            body: JSON.stringify({ token: botToken }),
+            signal: ctrl.signal
           }).then(r => r.json()).catch(() => null);
 
           if (backendTest?.ok && backendTest.bot) {
             botData = backendTest.bot;
           }
+        } catch {} finally {
+          clearTimeout(tId);
         }
 
-        // Store session
+        // Se backend não respondeu (ex: Vercel estático), testa direto na API Discord
+        if (!botData) {
+          const dCtrl = new AbortController();
+          const dTId = setTimeout(() => dCtrl.abort(), 2500);
+          try {
+            const testRes = await fetch("https://discord.com/api/v10/users/@me", {
+              headers: { Authorization: `Bot ${botToken}` },
+              signal: dCtrl.signal
+            });
+            if (testRes.ok) {
+              const rawUser = await testRes.json();
+              botData = {
+                id: rawUser.id,
+                username: rawUser.username,
+                tag: `${rawUser.username}${rawUser.discriminator && rawUser.discriminator !== '0' ? '#' + rawUser.discriminator : ''}`,
+                avatar: rawUser.avatar ? `https://cdn.discordapp.com/avatars/${rawUser.id}/${rawUser.avatar}.png` : null
+              };
+            }
+          } catch {} finally {
+            clearTimeout(dTId);
+          }
+        }
+
+        // Armazena sessão e avança
         state.botToken = botToken;
         state.guildId = guildId;
         state.panelPassword = panelPassword;
@@ -2694,24 +2752,24 @@
       });
       sidebarOverlay.addEventListener("click", closeSidebar);
 
-      // Form inputs sync with ranges
+      // Form inputs sync with ranges com debounce suave
       const amount = document.getElementById("amount");
       const amountRange = document.getElementById("amountRange");
       if (amount && amountRange) {
-        amount.addEventListener("input", () => { amountRange.value = amount.value; updateLivePreview(); });
-        amountRange.addEventListener("input", () => { amount.value = amountRange.value; updateLivePreview(); });
+        amount.addEventListener("input", () => { amountRange.value = amount.value; schedulePreviewUpdate(); });
+        amountRange.addEventListener("input", () => { amount.value = amountRange.value; schedulePreviewUpdate(); });
       }
 
       const msgAmount = document.getElementById("messageAmount");
       const msgAmountRange = document.getElementById("messageAmountRange");
       if (msgAmount && msgAmountRange) {
-        msgAmount.addEventListener("input", () => { msgAmountRange.value = msgAmount.value; updateLivePreview(); });
-        msgAmountRange.addEventListener("input", () => { msgAmount.value = msgAmountRange.value; updateLivePreview(); });
+        msgAmount.addEventListener("input", () => { msgAmountRange.value = msgAmount.value; schedulePreviewUpdate(); });
+        msgAmountRange.addEventListener("input", () => { msgAmount.value = msgAmountRange.value; schedulePreviewUpdate(); });
       }
 
       ["newName", "baseName", "message"].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.addEventListener("input", updateLivePreview);
+        if (el) el.addEventListener("input", schedulePreviewUpdate);
       });
 
       // Modal buttons

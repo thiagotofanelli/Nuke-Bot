@@ -46,10 +46,6 @@ if (BOT_TOKEN) {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function getToken(req) {
   return req.headers["x-bot-token"] || BOT_TOKEN || "";
 }
@@ -102,7 +98,7 @@ async function discordRestFetch(endpoint, options = {}, token) {
   return data;
 }
 
-// Validação de token ou login
+// Rota de login
 app.post("/api/login", checkPassword, async (req, res) => {
   const token = getToken(req);
   let botData = null;
@@ -137,8 +133,9 @@ app.post("/api/login", checkPassword, async (req, res) => {
   });
 });
 
+// Validação ultrarrápida de token
 app.post("/api/validate-token", async (req, res) => {
-  const token = req.body.token || getToken(req);
+  const token = req.body?.token || getToken(req);
   if (!token) {
     return res.status(400).json({ ok: false, message: "Token não fornecido." });
   }
@@ -237,7 +234,7 @@ async function deleteChannelsByType(type, req) {
           if (type === "voice") return channel.type === ChannelType.GuildVoice;
           if (type === "all") return channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildVoice;
           return false;
-        }).map(c => ({ id: c.id, name: c.name }));
+        }).map(c => ({ id: c.id, name: c.name, channelObj: c }));
       }
     } catch {
       channelList = [];
@@ -259,24 +256,29 @@ async function deleteChannelsByType(type, req) {
 
   let deleted = 0;
   const errors = [];
-  const batchSize = 5;
+  
+  // Concorrência rápida em lotes de 15 sem sleeps desnecessários
+  const batchSize = 15;
 
   for (let i = 0; i < channelList.length; i += batchSize) {
     const batch = channelList.slice(i, i + batchSize);
 
     const results = await Promise.allSettled(
-      batch.map(channel => discordRestFetch(`/channels/${channel.id}`, { method: "DELETE" }, token))
+      batch.map(item => {
+        if (item.channelObj && typeof item.channelObj.delete === "function") {
+          return item.channelObj.delete("Ação feita pelo painel Thiagtf.");
+        }
+        return discordRestFetch(`/channels/${item.id}`, { method: "DELETE" }, token);
+      })
     );
 
     results.forEach((result, index) => {
       if (result.status === "fulfilled") {
         deleted++;
       } else {
-        errors.push(`${batch[index].name}: ${result.reason.message}`);
+        errors.push(`${batch[index].name}: ${result.reason?.message || "erro"}`);
       }
     });
-
-    await sleep(150);
   }
 
   return {
@@ -303,39 +305,66 @@ async function createTextChannels({ amount, baseName, message, messageAmount }, 
   const createdChannelIds = [];
   const errors = [];
 
-  for (let i = 1; i <= safeAmount; i++) {
+  let guild = null;
+  if (clientReady && client) {
     try {
-      const channelData = await discordRestFetch(`/guilds/${guildId}/channels`, {
-        method: "POST",
-        body: JSON.stringify({
-          name: `${baseName}-${i}`,
-          type: 0 // GuildText
-        })
-      }, token);
-
-      if (channelData && channelData.id) {
-        created.push(channelData.name);
-        createdChannelIds.push(channelData.id);
-      }
-    } catch (err) {
-      errors.push(err.message);
+      guild = await getGuild(guildId);
+    } catch {
+      guild = null;
     }
   }
 
+  // Criação PARALELA simultânea de todos os canais solicitados (Super rápido)
+  const channelCreationTasks = [];
+  for (let i = 1; i <= safeAmount; i++) {
+    const chName = `${baseName}-${i}`;
+    if (guild) {
+      channelCreationTasks.push(
+        guild.channels.create({
+          name: chName,
+          type: ChannelType.GuildText,
+          reason: "Canais criados pelo painel Thiagtf."
+        }).then(ch => ({ id: ch.id, name: ch.name }))
+      );
+    } else {
+      channelCreationTasks.push(
+        discordRestFetch(`/guilds/${guildId}/channels`, {
+          method: "POST",
+          body: JSON.stringify({
+            name: chName,
+            type: 0 // GuildText
+          })
+        }, token).then(ch => ({ id: ch.id, name: ch.name }))
+      );
+    }
+  }
+
+  const creationResults = await Promise.allSettled(channelCreationTasks);
+  creationResults.forEach((res, idx) => {
+    if (res.status === "fulfilled" && res.value?.id) {
+      created.push(res.value.name);
+      createdChannelIds.push(res.value.id);
+    } else {
+      errors.push(`Canal ${idx + 1}: ${res.reason?.message || "falha ao criar"}`);
+    }
+  });
+
+  // Disparo PARALELO de mensagens em todos os canais criados (Sem travar em loop sequencial)
   if (message && safeMessageAmount > 0 && createdChannelIds.length > 0) {
+    const msgTasks = [];
     for (const channelId of createdChannelIds) {
       for (let m = 1; m <= safeMessageAmount; m++) {
-        try {
-          await discordRestFetch(`/channels/${channelId}/messages`, {
+        msgTasks.push(
+          discordRestFetch(`/channels/${channelId}/messages`, {
             method: "POST",
             body: JSON.stringify({ content: message })
-          }, token);
-          await sleep(50);
-        } catch (error) {
-          errors.push(`Canal ${channelId}: ${error.message}`);
-        }
+          }, token).catch(err => {
+            errors.push(`Mensagem no canal ${channelId}: ${err.message}`);
+          })
+        );
       }
     }
+    await Promise.allSettled(msgTasks);
   }
 
   return {
@@ -456,22 +485,16 @@ app.post("/api/reset", checkPassword, async (req, res) => {
       });
     }
 
+    // 1. Renomeia se nome foi especificado
     let renamed = null;
-
     if (newName && String(newName).trim().length >= 2) {
       renamed = await changeServerName(newName, req);
     }
 
-    await sleep(150);
+    // 2. Apaga canais de texto e voz de forma rápida e simultânea
+    const deletedAll = await deleteChannelsByType("all", req);
 
-    const deletedText = await deleteChannelsByType("text", req);
-
-    await sleep(150);
-
-    const deletedVoice = await deleteChannelsByType("voice", req);
-
-    await sleep(150);
-
+    // 3. Cria novos canais e dispara mensagens em paralelo
     const created = await createTextChannels({
       amount,
       baseName,
@@ -481,19 +504,18 @@ app.post("/api/reset", checkPassword, async (req, res) => {
 
     res.json({
       ok: true,
-      message: "Reset concluído com sucesso.",
+      message: "Reset concluído com sucesso e velocidade máxima.",
       result: {
         ordem: [
           "1 - Nome do servidor alterado",
-          "2 - Canais de texto apagados",
-          "3 - Canais de voz apagados",
-          "4 - Canais de texto criados",
-          "5 - Mensagens enviadas"
+          "2 - Canais de texto e voz apagados em paralelo",
+          "3 - Canais de texto criados em paralelo",
+          "4 - Mensagens enviadas em paralelo"
         ],
         renamed,
-        deletedText,
-        deletedVoice,
-        created
+        deleted: deletedAll.deleted,
+        created: created.created.length,
+        errors: [...(deletedAll.errors || []), ...(created.errors || [])]
       }
     });
   } catch (error) {
