@@ -313,4 +313,207 @@ async function createTextChannels({ amount, baseName, message, messageAmount }, 
         })
       }, token);
 
-      if (channelData 
+      if (channelData && channelData.id) {
+        created.push(channelData.name);
+        createdChannelIds.push(channelData.id);
+      }
+    } catch (err) {
+      errors.push(err.message);
+    }
+  }
+
+  if (message && safeMessageAmount > 0 && createdChannelIds.length > 0) {
+    for (const channelId of createdChannelIds) {
+      for (let m = 1; m <= safeMessageAmount; m++) {
+        try {
+          await discordRestFetch(`/channels/${channelId}/messages`, {
+            method: "POST",
+            body: JSON.stringify({ content: message })
+          }, token);
+          await sleep(50);
+        } catch (error) {
+          errors.push(`Canal ${channelId}: ${error.message}`);
+        }
+      }
+    }
+  }
+
+  return {
+    created,
+    errors
+  };
+}
+
+app.post("/api/delete-text", checkPassword, async (req, res) => {
+  try {
+    const result = await deleteChannelsByType("text", req);
+
+    res.json({
+      ok: true,
+      message: `Canais de texto apagados: ${result.deleted}`,
+      result
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message
+    });
+  }
+});
+
+app.post("/api/delete-voice", checkPassword, async (req, res) => {
+  try {
+    const result = await deleteChannelsByType("voice", req);
+
+    res.json({
+      ok: true,
+      message: `Canais de voz apagados: ${result.deleted}`,
+      result
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message
+    });
+  }
+});
+
+app.post("/api/delete-all", checkPassword, async (req, res) => {
+  try {
+    const result = await deleteChannelsByType("all", req);
+
+    res.json({
+      ok: true,
+      message: `Canais de texto e voz apagados: ${result.deleted}`,
+      result
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message
+    });
+  }
+});
+
+app.post("/api/create-text", checkPassword, async (req, res) => {
+  try {
+    const { amount, baseName, message, messageAmount } = req.body;
+
+    if (!baseName || baseName.length < 2) {
+      return res.status(400).json({
+        ok: false,
+        message: "Digite um nome base para os canais."
+      });
+    }
+
+    const result = await createTextChannels({
+      amount,
+      baseName,
+      message,
+      messageAmount
+    }, req);
+
+    res.json({
+      ok: true,
+      message: `Canais criados: ${result.created.length}`,
+      result
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message
+    });
+  }
+});
+
+app.post("/api/change-server-name", checkPassword, async (req, res) => {
+  try {
+    const { newName } = req.body;
+
+    const result = await changeServerName(newName, req);
+
+    res.json({
+      ok: true,
+      message: `Nome do servidor alterado para: ${result.newName}`,
+      result
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message
+    });
+  }
+});
+
+app.post("/api/reset", checkPassword, async (req, res) => {
+  try {
+    const { amount, baseName, message, messageAmount, newName } = req.body;
+
+    if (!baseName || baseName.length < 2) {
+      return res.status(400).json({
+        ok: false,
+        message: "Digite o nome base dos novos canais."
+      });
+    }
+
+    let renamed = null;
+
+    if (newName && String(newName).trim().length >= 2) {
+      renamed = await changeServerName(newName, req);
+    }
+
+    await sleep(150);
+
+    const deletedText = await deleteChannelsByType("text", req);
+
+    await sleep(150);
+
+    const deletedVoice = await deleteChannelsByType("voice", req);
+
+    await sleep(150);
+
+    const created = await createTextChannels({
+      amount,
+      baseName,
+      message,
+      messageAmount
+    }, req);
+
+    res.json({
+      ok: true,
+      message: "Reset concluído com sucesso.",
+      result: {
+        ordem: [
+          "1 - Nome do servidor alterado",
+          "2 - Canais de texto apagados",
+          "3 - Canais de voz apagados",
+          "4 - Canais de texto criados",
+          "5 - Mensagens enviadas"
+        ],
+        renamed,
+        deletedText,
+        deletedVoice,
+        created
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message
+    });
+  }
+});
+
+// Fallback SPA para todas as rotas não-API
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// Iniciar servidor se não estiver sendo importado pelo Vercel
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`[NUKE] Painel rodando em http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
